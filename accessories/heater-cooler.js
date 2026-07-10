@@ -1199,14 +1199,7 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
         setMethod: this.setCharacteristicValue,
         bind: this,
         props: {
-          setValuePromise: (async (hexData, previousValue) => {
-  if (this.state.targetHeaterCoolerState !== Characteristic.TargetHeaterCoolerState.HEAT) {
-    this.state.targetHeaterCoolerState = Characteristic.TargetHeaterCoolerState.HEAT;
-    this.serviceManager.setCharacteristic(Characteristic.TargetHeaterCoolerState, Characteristic.TargetHeaterCoolerState.HEAT);
-    this.updateServiceCurrentHeaterCoolerState();
-  }
-  return this.setTemperature(hexData, previousValue);
-}).bind(this),
+          setValuePromise: this.setTemperature.bind(this),
         }
       })
       // Characteristic properties
