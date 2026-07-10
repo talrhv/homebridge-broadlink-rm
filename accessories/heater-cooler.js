@@ -184,6 +184,7 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     if (logLevel <= 2) {log(`Changing target state from ${previousValue} to ${targetHeaterCoolerState}`)}
     switch (targetHeaterCoolerState) {
       case Characteristic.TargetHeaterCoolerState.COOL:
+      case Characteristic.TargetHeaterCoolerState.AUTO:
         if (available.cool.temperatureCodes) {
           // update internal state to be consistent with what Home app & homebridge see
           coolingThresholdTemperature = this.serviceManager.getCharacteristic(Characteristic.CoolingThresholdTemperature).value
@@ -224,6 +225,7 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     var temperature
     switch (targetHeaterCoolerState) {
+      case Characteristic.TargetHeaterCoolerState.AUTO:
       case Characteristic.TargetHeaterCoolerState.COOL:
         temperature = coolingThresholdTemperature
         if (!available.coolMode) {
