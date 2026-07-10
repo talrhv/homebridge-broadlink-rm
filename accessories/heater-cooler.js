@@ -381,9 +381,31 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
    * @param {string} hexData
    * @param {number} previousValue - previous temperature value
    */
-  async setTemperature(hexData, previousValue) {
+  async setTemperature(sliderMode, hexData, previousValue) {
     const { name, log, logLevel, state, config } = this
     const { targetHeaterCoolerState, coolingThresholdTemperature, heatingThresholdTemperature } = state
+
+    const isCoolSlider = sliderMode === Characteristic.TargetHeaterCoolerState.COOL
+    const newValue = isCoolSlider ? coolingThresholdTemperature : heatingThresholdTemperature
+
+    // Both the cooling and heating threshold sliders are wired to this handler. If the
+    // slider that changed belongs to a mode other than the one the accessory is currently
+    // in (e.g. Siri "set heating to 25" arrives as a HeatingThreshold write while the unit
+    // is still in Cool), switch the mode and let setTargetHeaterCoolerState send the code
+    // for the new mode. Guarded so it only flips on a genuine value change while the unit
+    // is on - incidental same-value nudges from HomeKit don't change the mode on their own.
+    // AUTO is left to the existing (mode-based) path since both sliders are active there.
+    if (targetHeaterCoolerState !== Characteristic.TargetHeaterCoolerState.AUTO
+      && sliderMode !== targetHeaterCoolerState) {
+      if (state.active === Characteristic.Active.ACTIVE && newValue !== previousValue) {
+        if (logLevel <= 2) {log(`${name} setTemperature: ${isCoolSlider ? 'cooling' : 'heating'} slider changed to ${newValue} while in ${isCoolSlider ? 'heat' : 'cool'} mode - switching mode`)}
+        this.serviceManager.setCharacteristic(Characteristic.TargetHeaterCoolerState, sliderMode)
+      } else {
+        if (logLevel <= 2) {log(`${name} setTemperature: ignoring ${isCoolSlider ? 'cooling' : 'heating'} threshold (${newValue}) - unit is ${state.active === Characteristic.Active.ACTIVE ? 'in the other mode' : 'off'}, no data sent`)}
+      }
+
+      return
+    }
 
     const targetTemperature = targetHeaterCoolerState === Characteristic.TargetHeaterCoolerState.COOL ? coolingThresholdTemperature : heatingThresholdTemperature;
 
@@ -1199,14 +1221,7 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
         setMethod: this.setCharacteristicValue,
         bind: this,
         props: {
-          setValuePromise: (async (hexData, previousValue) => {
-  if (this.state.targetHeaterCoolerState !== Characteristic.TargetHeaterCoolerState.HEAT) {
-    this.state.targetHeaterCoolerState = Characteristic.TargetHeaterCoolerState.HEAT;
-    this.serviceManager.setCharacteristic(Characteristic.TargetHeaterCoolerState, Characteristic.TargetHeaterCoolerState.HEAT);
-    this.updateServiceCurrentHeaterCoolerState();
-  }
-  return this.setTemperature(hexData, previousValue);
-}).bind(this),
+          setValuePromise: this.setTemperature.bind(this, Characteristic.TargetHeaterCoolerState.COOL),
         }
       })
       // Characteristic properties
@@ -1227,7 +1242,7 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
         setMethod: this.setCharacteristicValue,
         bind: this,
         props: {
-          setValuePromise: this.setTemperature.bind(this),
+          setValuePromise: this.setTemperature.bind(this, Characteristic.TargetHeaterCoolerState.HEAT),
         }
       })
       // Characteristic properties
