@@ -108,6 +108,14 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
       config.temperatureUpdateFrequency = config.temperatureUpdateFrequency || 10;
     }
 
+    // Power monitoring plug ( mqttTopic identifier "power" ) - used to detect whether the unit is
+    // actually running. Readings between the two thresholds are treated as standby and ignored.
+    config.mqttPowerKey = config.mqttPowerKey || 'power';
+    if (config.mqttPowerOnThreshold === undefined) { config.mqttPowerOnThreshold = 20; }
+    if (config.mqttPowerOffThreshold === undefined) { config.mqttPowerOffThreshold = 10; }
+    if (config.mqttPowerGrace === undefined) { config.mqttPowerGrace = 15; }
+    config.mqttPowerStateOnly = config.mqttPowerStateOnly === undefined ? true : config.mqttPowerStateOnly;
+
     const { internalConfig } = config
     const { available } = internalConfig
     if (available.cool.rotationSpeed || available.heat.rotationSpeed) {
@@ -431,6 +439,10 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     hexData = this.decodeHexFromConfig(CharacteristicName.ACTIVE)
 
+    // Give the unit (and the power monitoring plug, if configured) time to catch up before
+    // power readings are allowed to change the state again
+    this.startMQTTPowerGrace()
+
     if (turnOnWhenOff === true && state.active === Characteristic.Active.ACTIVE && previousValue === Characteristic.Active.INACTIVE) {
       //Add ON hex to be sent first
       if (logLevel <= 2) {this.log(`\tAdding ON code first`);}
@@ -638,7 +650,7 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     }
 
     // Read temperature from mqtt
-    if (mqttURL) {
+    if (mqttURL && this.hasMQTTTemperatureTopic()) {
       const temperature = this.mqttValueForIdentifier('temperature');
       const humidity = noHumidity ? null : this.mqttValueForIdentifier('humidity');
       this.onTemperature(temperature || 0, humidity);
@@ -783,13 +795,21 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
   onMQTTMessage(identifier, message) {
     const { state, logLevel, log, name } = this;
 
-    if (identifier !== 'unknown' && identifier !== 'temperature' && identifier !== 'humidity' && identifier !== 'battery' && identifier !== 'combined') {
+    if (identifier !== 'unknown' && identifier !== 'temperature' && identifier !== 'humidity' && identifier !== 'battery' && identifier !== 'combined' && identifier !== 'power') {
       if (logLevel <= 4) {log(`\x1b[31m[ERROR] \x1b[0m${name} onMQTTMessage (mqtt message received with unexpected identifier: ${identifier}, ${message.toString()})`);}
 
       return;
     }
 
     super.onMQTTMessage(identifier, message);
+
+    // Power readings describe the unit's on/off state, not the room, so they bypass the
+    // temperature/humidity/battery parsing below entirely.
+    if (identifier === 'power') {
+      this.onMQTTPower(this.mqttValuesTemp[identifier]);
+
+      return;
+    }
 
     let temperatureValue, humidityValue, batteryValue;
     let objectFound = false;
@@ -873,6 +893,114 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
       this.mqttValues[identifier] = value;
     }
     this.updateTemperatureUI();
+  }
+
+  /**
+   * Whether any configured mqttTopic can supply a temperature reading. An accessory that only
+   * subscribes to a power monitoring plug must keep reading temperature from the Broadlink
+   * device rather than falling back to 0 degrees.
+   */
+  hasMQTTTemperatureTopic() {
+    const { mqttTopic } = this.config;
+
+    //A bare string topic is subscribed with the "unknown" identifier, which feeds temperature
+    if (typeof mqttTopic === 'string') {return true;}
+    if (!Array.isArray(mqttTopic)) {return false;}
+
+    return mqttTopic.some(({ identifier }) => identifier !== 'power');
+  }
+
+  /**
+   * Derives the unit's real on/off state from an energy monitoring smart plug published over
+   * MQTT ( mqttTopic identifier "power" ). The payload may either be a bare number or a JSON
+   * object containing mqttPowerKey - values are commonly published as strings, so they are
+   * always coerced with parseFloat.
+   *
+   * Standby draw is filtered with a hysteresis band: above mqttPowerOnThreshold the unit is
+   * reported as active, below mqttPowerOffThreshold as inactive, and anything in between
+   * leaves the current state alone. The HomeKit tile is refreshed with updateCharacteristic()
+   * rather than setCharacteristic() so that no IR/RF codes are transmitted back to the unit.
+   * @param {string} rawValue - the raw mqtt payload
+   */
+  onMQTTPower(rawValue) {
+    const { config, state, serviceManager, log, logLevel, name } = this;
+    const { mqttPowerKey, mqttPowerOnThreshold, mqttPowerOffThreshold, mqttPowerStateOnly } = config;
+
+    let value = rawValue;
+    try {
+      const powerJSON = JSON.parse(rawValue);
+
+      if (typeof powerJSON === 'object' && powerJSON !== null) {
+        if (Object.prototype.hasOwnProperty.call(powerJSON, mqttPowerKey)) {
+          value = powerJSON[mqttPowerKey];
+        } else {
+          //Nested payloads ( e.g. Tasmota's { "ENERGY": { "Power": 0 } } )
+          const values = findKey(powerJSON, mqttPowerKey);
+          value = values.length > 0 ? values[0] : undefined;
+        }
+      }
+    } catch (err) { } //Result couldn't be parsed as JSON, treat the payload as a bare number
+
+    const power = parseFloat(value);
+
+    if (isNaN(power)) {
+      if (logLevel <= 3) {log(`\x1b[31m[ERROR] \x1b[0m${name} onMQTTPower (no numeric "${mqttPowerKey}" value found in: ${rawValue})`);}
+
+      return;
+    }
+
+    let active;
+    if (power > mqttPowerOnThreshold) {
+      active = Characteristic.Active.ACTIVE;
+    } else if (power < mqttPowerOffThreshold) {
+      active = Characteristic.Active.INACTIVE;
+    } else {
+      if (logLevel <= 1) {log(`\x1b[34m[DEBUG]\x1b[0m ${name} onMQTTPower (${power}W is within the standby band ${mqttPowerOffThreshold}-${mqttPowerOnThreshold}W, keeping state)`);}
+
+      return;
+    }
+
+    if (active === state.active) {return;}
+
+    // A HomeKit initiated change is still settling - the plug hasn't caught up yet
+    if (this.mqttPowerGraceTimeoutPromise) {
+      if (logLevel <= 1) {log(`\x1b[34m[DEBUG]\x1b[0m ${name} onMQTTPower (${power}W ignored, state change still in progress)`);}
+
+      return;
+    }
+
+    if (logLevel <= 2) {log(`\x1b[35m[INFO]\x1b[0m ${name} onMQTTPower (${power}W reported by plug, unit is now ${active === Characteristic.Active.ACTIVE ? 'active' : 'inactive'})`);}
+
+    if (mqttPowerStateOnly === false) {
+      // Opt-in: treat the plug as a command and let the normal handler send hex codes
+      serviceManager.setCharacteristic(Characteristic.Active, active);
+
+      return;
+    }
+
+    state.active = active;
+    serviceManager.updateCharacteristic(Characteristic.Active, active);
+    this.updateServiceCurrentHeaterCoolerState();
+  }
+
+  /**
+   * Suppresses power based state detection for mqttPowerGrace seconds after a HomeKit initiated
+   * change, so that a stale standby reading doesn't immediately flip the tile back.
+   */
+  async startMQTTPowerGrace() {
+    await catchDelayCancelError(async () => {
+      const { config } = this;
+      const { mqttURL, mqttPowerGrace } = config;
+
+      if (!mqttURL || !mqttPowerGrace) {return;}
+
+      if (this.mqttPowerGraceTimeoutPromise) {this.mqttPowerGraceTimeoutPromise.cancel();}
+
+      this.mqttPowerGraceTimeoutPromise = delayForDuration(mqttPowerGrace);
+      await this.mqttPowerGraceTimeoutPromise;
+
+      this.mqttPowerGraceTimeoutPromise = null;
+    });
   }
 
   /**

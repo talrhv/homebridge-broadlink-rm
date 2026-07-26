@@ -33,6 +33,66 @@
 | swingDnd | Hex code to set without changing the current swing mode of device |
 | swingToggle | Hex code to toggle swing mode |
 
+## Power based state detection (MQTT)
+
+IR is one-way, so the plugin normally only knows the state it last commanded. If the unit is
+plugged into an energy monitoring smart plug (Athom V2, Tasmota, Shelly, ...) that publishes its
+power draw over MQTT, add a `mqttTopic` entry with the identifier `power` and the accessory will
+report the real on/off state to HomeKit.
+
+| key | description | example | default |
+| -- | -- | -- | -- |
+| mqttURL | Broker to connect to. Required for any MQTT feature | mqtt://192.168.1.10 | - |
+| mqttTopic | Topic list; use identifier `power` for the plug's energy topic | see below | - |
+| mqttPowerKey | Key to read from the JSON payload. Nested objects are searched too | apparent_power | power |
+| mqttPowerOnThreshold | Above this many watts the unit is reported Active | 20 | 20 |
+| mqttPowerOffThreshold | Below this many watts the unit is reported Inactive | 10 | 10 |
+| mqttPowerGrace | Seconds to ignore plug readings after a HomeKit initiated change | 30 | 15 |
+| mqttPowerStateOnly | `true` updates the tile only. `false` also sends the matching hex codes | false | true |
+
+```json
+"mqttURL": "mqtt://192.168.1.10",
+"mqttTopic": [{
+  "identifier": "power",
+  "topic": "athom_ac_plug/energy"
+}],
+"mqttPowerKey": "power",
+"mqttPowerOnThreshold": 20,
+"mqttPowerOffThreshold": 10,
+"mqttPowerGrace": 30
+```
+
+The `power` identifier sits alongside the existing ones, so a temperature topic can be subscribed
+at the same time - each identifier is parsed independently and a power reading never touches the
+cached temperature:
+
+```json
+"mqttTopic": [{
+  "identifier": "power",
+  "topic": "athom_ac_plug/energy"
+},{
+  "identifier": "temperature",
+  "topic": "sensor/livingroom/temperature"
+}]
+```
+
+Give each identifier its own topic - two identifiers pointing at the same topic string means only
+the last one wins. If a single payload carries temperature and humidity together, use the
+`combined` identifier for it and keep `power` on the plug's own topic. Without any
+temperature-bearing topic, temperature keeps coming from the Broadlink device's own probe.
+
+Values are read with `parseFloat`, so payloads that quote their numbers (`"power": "0"`) work
+unchanged. Readings that land *between* the two thresholds are treated as standby and leave the
+state untouched - this hysteresis band is what stops a 2-5 W idle draw from flapping the tile.
+
+With the default `mqttPowerStateOnly: true` the plugin only pushes the new value to HomeKit and
+never transmits IR/RF in response to a plug reading, so an update cannot toggle the unit. Set it
+to `false` only if you deliberately want the plug to drive the unit (this does send hex codes).
+
+`mqttPowerGrace` covers the lag between a HomeKit command and the plug catching up: for the few
+seconds after you press the tile, the still-low reading is ignored instead of snapping the tile
+back off. Raise it if your plug reports infrequently.
+
 ## FAQ
 1. All *italicized* keys are required.
 2. At least one of heat or cool object should be present else the device will not be configured and cause an error.
