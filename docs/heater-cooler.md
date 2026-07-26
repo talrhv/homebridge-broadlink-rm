@@ -49,6 +49,8 @@ report the real on/off state to HomeKit.
 | mqttPowerOffThreshold | Below this many watts the unit is reported Inactive | 10 | 10 |
 | mqttPowerGrace | Seconds to ignore plug readings after a HomeKit initiated change | 30 | 15 |
 | mqttPowerStateOnly | `true` updates the tile only. `false` also sends the matching hex codes | false | true |
+| mqttPowerSensor | Publish a read-only contact sensor showing what the plug reports | true | false |
+| mqttPowerSensorName | Name for that sensor | AC Running | `<name> Power` |
 
 ```json
 "mqttURL": "mqtt://192.168.1.10",
@@ -92,6 +94,18 @@ to `false` only if you deliberately want the plug to drive the unit (this does s
 `mqttPowerGrace` covers the lag between a HomeKit command and the plug catching up: for the few
 seconds after you press the tile, the still-low reading is ignored instead of snapping the tile
 back off. Raise it if your plug reports infrequently.
+
+### Seeing the power state
+
+A HeaterCooler service has no characteristic for power draw, so by default the only visible effect
+is the tile turning itself on and off. Setting `mqttPowerSensor: true` adds a read-only contact
+sensor to the same accessory - **Open** while the unit is drawing power, **Closed** in standby -
+which is visible in the Home app and usable as an automation trigger. It is a sensor, so it cannot
+be tapped and can never cause a transmission.
+
+The sensor tracks the plug directly rather than the tile, so the two disagree during
+`mqttPowerGrace`. That gap is useful: if the tile says on while the sensor still says Closed a
+minute later, the IR command never reached the unit, and an automation can react to that.
 
 ## FAQ
 1. All *italicized* keys are required.

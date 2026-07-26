@@ -60,6 +60,9 @@ const newAccessory = (overrides) => new HeaterCooler(
 // There is no broker in tests, and mqttValueForIdentifier() bails unless the client is connected
 const connectMQTT = (accessory) => { accessory.mqttClient.connected = true; };
 
+const contactState = (accessory) =>
+  accessory.powerSensorService.getCharacteristic(Characteristic.ContactSensorState).value;
+
 // MQTT temperature only reaches state.currentTemperature when HomeKit reads the characteristic
 const readTemperature = (accessory) => new Promise((resolve, reject) => {
   accessory.getCurrentTemperature((err, value) => (err ? reject(err) : resolve(value)));
@@ -195,6 +198,52 @@ describe('heaterCooler mqtt power state detection', () => {
     expect(accessory.state.currentHumidity).to.equal(48);
     expect(accessory.state.active).to.equal(Characteristic.Active.ACTIVE);
   });
+
+  it('exposes no extra service unless mqttPowerSensor is set', () => {
+    const accessory = newAccessory();
+
+    expect(accessory.powerSensorService).to.equal(undefined);
+    expect(accessory.getServices().some((service) => service instanceof Service.ContactSensor)).to.equal(false);
+  });
+
+  it('publishes a contact sensor that follows the plug', () => {
+    const accessory = newAccessory({ mqttPowerSensor: true });
+    const sensor = accessory.powerSensorService;
+
+    expect(accessory.getServices()).to.include(sensor);
+    expect(sensor.displayName).to.equal('AC Power');
+    expect(contactState(accessory)).to.equal(Characteristic.ContactSensorState.CONTACT_DETECTED);
+
+    accessory.onMQTTMessage('power', Buffer.from(ENERGY(910)));
+    expect(contactState(accessory)).to.equal(Characteristic.ContactSensorState.CONTACT_NOT_DETECTED, 'open while drawing');
+
+    accessory.onMQTTMessage('power', Buffer.from(ENERGY(3)));
+    expect(contactState(accessory)).to.equal(Characteristic.ContactSensorState.CONTACT_DETECTED, 'closed in standby');
+  });
+
+  it('honours mqttPowerSensorName', () => {
+    const accessory = newAccessory({ mqttPowerSensor: true, mqttPowerSensorName: 'Bedroom AC Running' });
+
+    expect(accessory.powerSensorService.displayName).to.equal('Bedroom AC Running');
+  });
+
+  it('lets the sensor report real power while the tile is held back during grace', async () => {
+    const accessory = newAccessory({ mqttPowerSensor: true });
+    accessory.config.mqttPowerGrace = 2;
+
+    accessory.startMQTTPowerGrace();
+    accessory.onMQTTMessage('power', Buffer.from(ENERGY(900)));
+
+    // The plug says it is drawing, the tile is still suppressed - they are meant to disagree here
+    expect(contactState(accessory)).to.equal(Characteristic.ContactSensorState.CONTACT_NOT_DETECTED);
+    expect(accessory.state.active).to.equal(Characteristic.Active.INACTIVE);
+
+    await new Promise((resolve) => setTimeout(resolve, 2200));
+
+    accessory.onMQTTMessage('power', Buffer.from(ENERGY(900)));
+    expect(accessory.state.active).to.equal(Characteristic.Active.ACTIVE);
+    expect(contactState(accessory)).to.equal(Characteristic.ContactSensorState.CONTACT_NOT_DETECTED);
+  }).timeout(6000);
 
   it('rejects a payload with no usable value', () => {
     const accessory = newAccessory();

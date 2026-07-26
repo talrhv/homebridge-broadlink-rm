@@ -69,6 +69,51 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     this.temperatureCallbackQueue = {};
     this.monitorTemperature();
+
+    // Safe to build here - setDefaults() has run and no mqtt message can have been handled yet
+    if (config.mqttPowerSensor) {this.setupPowerSensor();}
+  }
+
+  /**
+   * Read-only contact sensor exposed alongside the HeaterCooler service, reflecting what the
+   * energy monitoring plug reports: Open (contact not detected) while the unit is drawing power,
+   * Closed while it is in standby. HomeKit offers no power characteristic on a HeaterCooler, and
+   * a sensor cannot be tapped, so this can never trigger a transmission.
+   */
+  setupPowerSensor() {
+    const { config, state } = this;
+
+    this.powerSensorService = new Service.ContactSensor(config.mqttPowerSensorName, 'power');
+    this.powerSensorService
+      .getCharacteristic(Characteristic.ContactSensorState)
+      .updateValue(this.contactStateForActive(state.active));
+  }
+
+  contactStateForActive(active) {
+    return active === Characteristic.Active.ACTIVE
+      ? Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+      : Characteristic.ContactSensorState.CONTACT_DETECTED;
+  }
+
+  /**
+   * Mirrors the plug's own verdict, independently of the Active characteristic. During the
+   * mqttPowerGrace window the two deliberately disagree - that gap is what tells you an IR
+   * command didn't actually reach the unit.
+   */
+  updatePowerSensor(active) {
+    if (!this.powerSensorService) {return;}
+
+    this.powerSensorService
+      .getCharacteristic(Characteristic.ContactSensorState)
+      .updateValue(this.contactStateForActive(active));
+  }
+
+  getServices() {
+    const services = super.getServices();
+
+    if (this.powerSensorService) {services.push(this.powerSensorService);}
+
+    return services;
   }
 
   /**
@@ -115,6 +160,8 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     if (config.mqttPowerOffThreshold === undefined) { config.mqttPowerOffThreshold = 10; }
     if (config.mqttPowerGrace === undefined) { config.mqttPowerGrace = 15; }
     config.mqttPowerStateOnly = config.mqttPowerStateOnly === undefined ? true : config.mqttPowerStateOnly;
+    config.mqttPowerSensor = config.mqttPowerSensor === undefined ? false : config.mqttPowerSensor;
+    config.mqttPowerSensorName = config.mqttPowerSensorName || `${config.name} Power`;
 
     const { internalConfig } = config
     const { available } = internalConfig
@@ -959,6 +1006,9 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
       return;
     }
+
+    // The sensor always reports the plug, even while the tile is held back below
+    this.updatePowerSensor(active);
 
     if (active === state.active) {return;}
 
