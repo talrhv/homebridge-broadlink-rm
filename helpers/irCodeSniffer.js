@@ -77,7 +77,11 @@ const startLoop = (key, log, logLevel) => {
     });
 
     // Re-arm immediately so the next remote button press is captured too.
-    device.enterLearning();
+    try {
+      device.enterLearning();
+    } catch (err) {
+      if (logLevel <= 4) {log(`\x1b[31m[ERROR]\x1b[0m IR Code Sniffer (${labelFor(entry.host)}) failed to re-arm learning mode: ${err.message}`);}
+    }
   };
 
   device.on('rawData', entry.onRawData);
@@ -94,9 +98,19 @@ const poll = (key) => {
     const current = registry[key];
     if (!current || !current.device) {return;}
 
-    await current.device.mutex.use(async () => {
-      current.device.checkData();
-    });
+    try {
+      await current.device.mutex.use(async () => {
+        // Re-arm learning mode on every tick, not just after a capture - actually transmitting
+        // an IR/RF command (e.g. turning the AC on/off from HomeKit or MQTT) can silently knock
+        // some Broadlink firmwares out of learning mode with no error of any kind, so this keeps
+        // the listener self-healing instead of going silently dead until Homebridge restarts.
+        current.device.enterLearning();
+        current.device.checkData();
+      });
+    } catch (err) {
+      // A transient send/mutex hiccup must never permanently stop the passive listener - the
+      // next tick will simply try again.
+    }
 
     poll(key);
   }, POLL_INTERVAL);
