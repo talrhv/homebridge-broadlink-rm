@@ -7,6 +7,7 @@ const delayForDuration = require('../helpers/delayForDuration');
 const ServiceManagerTypes = require('../helpers/serviceManagerTypes');
 const catchDelayCancelError = require('../helpers/catchDelayCancelError');
 const { getDevice, discoverDevices } = require('../helpers/getDevice');
+const irCodeSniffer = require('../helpers/irCodeSniffer');
 const BroadlinkRMAccessory = require('./accessory');
 
 // Initializing predefined constants based on homekit API
@@ -72,6 +73,160 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     // Safe to build here - setDefaults() has run and no mqtt message can have been handled yet
     if (config.mqttPowerSensor) {this.setupPowerSensor();}
+
+    if (config.listenForRemoteUpdates) {
+      this.hexReverseMap = this.buildHexReverseMap();
+      irCodeSniffer.subscribe(this.host, this.log, this.logLevel, this.handleExternalIRCode.bind(this));
+    }
+  }
+
+  /**
+   * Builds a { hexString: matchInfo } lookup by walking this accessory's own data.cool/data.heat
+   * hex trees, so that a hex code captured from the physical remote (via irCodeSniffer) can be
+   * matched back to the mode/temperature/rotationSpeed/swingMode it represents. Hex codes are
+   * opaque IR waveforms - this only recognises codes that are already present in this
+   * accessory's own config.
+   */
+  buildHexReverseMap() {
+    const { data } = this;
+    const reverseMap = {};
+
+    if (!data) {return reverseMap;}
+
+    ['cool', 'heat'].forEach((mode) => {
+      const modeData = data[mode];
+      if (!modeData || typeof modeData !== 'object') {return;}
+
+      this.collectHexValues(modeData.on).forEach((hex) => {
+        reverseMap[hex] = { mode, active: true };
+      });
+      this.collectHexValues(modeData.off).forEach((hex) => {
+        reverseMap[hex] = { mode, active: false };
+      });
+
+      const { temperatureCodes } = modeData;
+      if (!temperatureCodes || typeof temperatureCodes !== 'object') {return;}
+
+      Object.keys(temperatureCodes).forEach((temperatureKey) => {
+        const temperature = parseFloat(temperatureKey);
+        if (isNaN(temperature)) {return;}
+
+        this.collectLeafHexPaths(temperatureCodes[temperatureKey]).forEach(({ hex, path }) => {
+          const match = { mode, active: true, temperature };
+
+          path.forEach((key) => {
+            const rotationSpeedMatch = key.match(/^rotationSpeed(\d+)$/);
+            if (rotationSpeedMatch) {match.rotationSpeed = parseInt(rotationSpeedMatch[1], 10);}
+            if (key === 'swingOn') {match.swingMode = Characteristic.SwingMode.SWING_ENABLED;}
+            if (key === 'swingOff') {match.swingMode = Characteristic.SwingMode.SWING_DISABLED;}
+          });
+
+          reverseMap[hex] = match;
+        });
+      });
+    });
+
+    return reverseMap;
+  }
+
+  // Extracts hex strings from a simple (non-tree) hex value - either a bare hex string or an
+  // array of { data, pause } send steps, as used for data.<mode>.on / data.<mode>.off.
+  collectHexValues(node) {
+    const results = [];
+
+    if (typeof node === 'string') {
+      results.push(node);
+    } else if (Array.isArray(node)) {
+      node.forEach((item) => {
+        if (item && typeof item === 'object' && typeof item.data === 'string') {results.push(item.data);}
+      });
+    }
+
+    return results;
+  }
+
+  // Recursively walks a temperatureCodes[temperature] hex tree (which may descend through
+  // rotationSpeedN/fanSpeedToggle/fanSpeedDnd and swingOn/swingOff/swingToggle/swingDnd levels,
+  // see decodeHierarchichalHex) collecting every leaf hex string along with the chain of keys
+  // used to reach it.
+  collectLeafHexPaths(node, path = []) {
+    const results = [];
+
+    if (node === undefined || node === null) {return results;}
+
+    if (typeof node === 'string') {
+      results.push({ hex: node, path });
+      return results;
+    }
+
+    if (Array.isArray(node)) {
+      node.forEach((item) => {
+        if (item && typeof item === 'object' && typeof item.data === 'string') {results.push({ hex: item.data, path });}
+      });
+      return results;
+    }
+
+    if (typeof node === 'object') {
+      Object.keys(node).forEach((key) => {
+        results.push(...this.collectLeafHexPaths(node[key], [...path, key]));
+      });
+    }
+
+    return results;
+  }
+
+  // Called by irCodeSniffer whenever the Broadlink device captures any IR code. Reflects a
+  // recognised remote-control button press into HomeKit without sending anything back out -
+  // mirrors the updateCharacteristic() (not setCharacteristic()) convention already used for
+  // MQTT-sourced state in onMQTTPower above.
+  handleExternalIRCode(hex) {
+    const { hexReverseMap, log, logLevel, name, serviceManager, state } = this;
+
+    const match = hexReverseMap && hexReverseMap[hex];
+    if (!match) {return;}
+
+    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify(match)})`);}
+
+    if (match.active === false) {
+      state.active = Characteristic.Active.INACTIVE;
+      serviceManager.updateCharacteristic(Characteristic.Active, state.active);
+      this.updateServiceCurrentHeaterCoolerState();
+
+      return;
+    }
+
+    if (match.active === true) {
+      state.active = Characteristic.Active.ACTIVE;
+      serviceManager.updateCharacteristic(Characteristic.Active, state.active);
+    }
+
+    if (match.mode) {
+      const targetHeaterCoolerState = match.mode === 'cool' ? Characteristic.TargetHeaterCoolerState.COOL : Characteristic.TargetHeaterCoolerState.HEAT;
+      state.targetHeaterCoolerState = targetHeaterCoolerState;
+      serviceManager.updateCharacteristic(Characteristic.TargetHeaterCoolerState, targetHeaterCoolerState);
+    }
+
+    if (match.temperature !== undefined) {
+      if (match.mode === 'cool') {
+        state.coolingThresholdTemperature = match.temperature;
+        serviceManager.updateCharacteristic(Characteristic.CoolingThresholdTemperature, match.temperature);
+      } else if (match.mode === 'heat') {
+        state.heatingThresholdTemperature = match.temperature;
+        serviceManager.updateCharacteristic(Characteristic.HeatingThresholdTemperature, match.temperature);
+      }
+    }
+
+    if (match.rotationSpeed !== undefined) {
+      state.rotationSpeed = match.rotationSpeed;
+      serviceManager.updateCharacteristic(Characteristic.RotationSpeed, match.rotationSpeed);
+    }
+
+    if (match.swingMode !== undefined) {
+      state.swingMode = match.swingMode;
+      serviceManager.updateCharacteristic(Characteristic.SwingMode, match.swingMode);
+    }
+
+    this.updateServiceCurrentHeaterCoolerState();
   }
 
   /**

@@ -7,6 +7,7 @@ const delayForDuration = require('../helpers/delayForDuration');
 const ServiceManagerTypes = require('../helpers/serviceManagerTypes');
 const catchDelayCancelError = require('../helpers/catchDelayCancelError');
 const { getDevice } = require('../helpers/getDevice');
+const irCodeSniffer = require('../helpers/irCodeSniffer');
 const BroadlinkRMAccessory = require('./accessory');
 
 class AirConAccessory extends BroadlinkRMAccessory {
@@ -42,6 +43,83 @@ class AirConAccessory extends BroadlinkRMAccessory {
 
     this.temperatureCallbackQueue = {};
     this.monitorTemperature();
+
+    if (config.listenForRemoteUpdates) {
+      this.hexReverseMap = this.buildHexReverseMap();
+      irCodeSniffer.subscribe(this.host, this.log, this.logLevel, this.handleExternalIRCode.bind(this));
+    }
+  }
+
+  // Builds a { hexString: { mode, temperature } } lookup from this accessory's own `data`
+  // config so that a hex code captured from the physical remote (via irCodeSniffer) can be
+  // matched back to the mode/temperature it represents. Hex codes are opaque IR waveforms -
+  // this only recognises codes that are already present in this accessory's own config.
+  buildHexReverseMap () {
+    const { data } = this;
+    const reverseMap = {};
+
+    if (!data) {return reverseMap;}
+
+    Object.keys(data).forEach((key) => {
+      const entry = data[key];
+      const hex = typeof entry === 'string' ? entry : entry && entry.data;
+
+      if (!hex) {return;}
+
+      if (key === 'off' || key === 'offDryMode') {
+        reverseMap[hex] = { mode: 'off' };
+        return;
+      }
+
+      if (key === 'heat' || key === 'cool' || key === 'auto') {
+        reverseMap[hex] = { mode: key };
+        return;
+      }
+
+      const modeTemperatureMatch = key.match(/^(heat|cool|auto)(\d+)$/);
+      if (modeTemperatureMatch) {
+        reverseMap[hex] = { mode: modeTemperatureMatch[1], temperature: parseInt(modeTemperatureMatch[2], 10) };
+        return;
+      }
+
+      const temperatureMatch = key.match(/^temperature(\d+)$/);
+      if (temperatureMatch) {
+        reverseMap[hex] = { mode: entry && entry['pseudo-mode'], temperature: parseInt(temperatureMatch[1], 10) };
+      }
+    });
+
+    return reverseMap;
+  }
+
+  // Called by irCodeSniffer whenever the Broadlink device captures any IR code. Reflects a
+  // recognised remote-control button press into HomeKit without sending anything back out -
+  // this is purely observational, mirroring the pattern used for MQTT-sourced state
+  // (see onMQTTMessage / updateTemperatureUI) which use updateCharacteristic() rather than
+  // setCharacteristic() to avoid re-triggering an outbound send.
+  handleExternalIRCode (hex) {
+    const { HeatingCoolingStates, hexReverseMap, log, logLevel, name, serviceManager, state } = this;
+
+    const match = hexReverseMap && hexReverseMap[hex];
+    if (!match) {return;}
+
+    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify(match)})`);}
+
+    if (match.mode) {
+      const heatingCoolingState = HeatingCoolingStates[match.mode];
+
+      if (heatingCoolingState !== undefined) {
+        state.targetHeatingCoolingState = heatingCoolingState;
+        state.currentHeatingCoolingState = (match.mode === 'off') ? Characteristic.CurrentHeatingCoolingState.OFF : heatingCoolingState;
+
+        serviceManager.updateCharacteristic(Characteristic.TargetHeatingCoolingState, state.targetHeatingCoolingState);
+        serviceManager.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, state.currentHeatingCoolingState);
+      }
+    }
+
+    if (match.temperature !== undefined) {
+      state.targetTemperature = match.temperature;
+      serviceManager.updateCharacteristic(Characteristic.TargetTemperature, state.targetTemperature);
+    }
   }
 
   correctReloadedState (state) {
@@ -246,11 +324,14 @@ class AirConAccessory extends BroadlinkRMAccessory {
     const mode = HeatingCoolingConfigKeys[state.targetHeatingCoolingState];
 
     if (state.currentHeatingCoolingState !== state.targetHeatingCoolingState){
-      // Selecting a heating/cooling state allows a default temperature to be used for the given state.
+      // Selecting a heating/cooling state resumes the temperature last used in that mode, if
+      // known, otherwise falls back to the configured default temperature for the given state.
       if (state.targetHeatingCoolingState === Characteristic.TargetHeatingCoolingState.HEAT) {
-        temperature = defaultHeatTemperature;
+        temperature = (state.lastHeatTemperature !== undefined) ? state.lastHeatTemperature : defaultHeatTemperature;
       } else if (state.targetHeatingCoolingState === Characteristic.TargetHeatingCoolingState.COOL) {
-        temperature = defaultCoolTemperature;
+        temperature = (state.lastCoolTemperature !== undefined) ? state.lastCoolTemperature : defaultCoolTemperature;
+      } else if (state.targetHeatingCoolingState === Characteristic.TargetHeatingCoolingState.AUTO && state.lastAutoTemperature !== undefined) {
+        temperature = state.lastAutoTemperature;
       }
 
       //Set the mode, and send the mode hex
@@ -330,6 +411,17 @@ class AirConAccessory extends BroadlinkRMAccessory {
       mode = hexData['pseudo-mode'];
       if (mode) {assert.oneOf(mode, [ 'heat', 'cool', 'auto' ], `\x1b[31m[CONFIG ERROR] \x1b[33mpseudo-mode\x1b[0m should be one of "heat", "cool" or "auto"`)}
       this.updateServiceCurrentHeatingCoolingState(HeatingCoolingStates[mode]);
+    }
+
+    // Remember the temperature used for this mode so it can be resumed the next time the
+    // air-conditioner is turned back on to this mode, rather than resetting to the configured
+    // default temperature every time.
+    if (mode === 'heat') {
+      state.lastHeatTemperature = finalTemperature;
+    } else if (mode === 'cool') {
+      state.lastCoolTemperature = finalTemperature;
+    } else if (mode === 'auto') {
+      state.lastAutoTemperature = finalTemperature;
     }
 
     if((previousTemperature !== finalTemperature) || (state.firstTemperatureUpdate && !preventResendHex)){

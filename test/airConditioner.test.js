@@ -1,3 +1,5 @@
+const os = require('os');
+const path = require('path');
 const { expect } = require('chai');
 
 const { log, setup } = require('./helpers/setup')
@@ -7,6 +9,9 @@ const delayForDuration = require('../helpers/delayForDuration')
 const { getDevice } = require('../helpers/getDevice')
 
 const { AirCon, Switch } = require('../accessories')
+
+// node-persist needs somewhere writable to initialise; keep it out of the real homebridge dir
+const testSetup = () => setup({ homebridgeDirectory: path.join(os.tmpdir(), 'homebridge-broadlink-rm-test') });
 
 const data = {
   on: 'ON',
@@ -36,7 +41,8 @@ const data = {
 const defaultConfig = {
   data,
   isUnitTest: true,
-  persistState: false
+  persistState: false,
+  noHistory: true
 };
 
 describe('airConAccessory', async () => {
@@ -536,12 +542,12 @@ describe('airConAccessory', async () => {
   it ('autoSwitch', async () => {
     const { device } = setup();
     defaultConfig.host = device.host.address
-    
+
     const config = {
       ...defaultConfig,
       autoSwitch: 'Air-Con Auto'
     };
-    
+
     const switchConfig = {
       ...defaultConfig,
       name: 'Air-Con Auto'
@@ -553,5 +559,118 @@ describe('airConAccessory', async () => {
     airConAccessory.updateAccessories([ switchAccessory ]);
 
     expect(airConAccessory.autoSwitchAccessory).to.equal(switchAccessory)
+  });
+
+  describe('handleExternalIRCode (passive remote-control detection)', () => {
+    it('updates target temperature and mode from a known remote-control hex code, without sending anything', async () => {
+      const { device } = testSetup();
+      defaultConfig.host = device.host.address
+
+      const config = { ...defaultConfig };
+      const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
+      airConAccessory.hexReverseMap = airConAccessory.buildHexReverseMap();
+
+      device.resetSentHexCodes();
+
+      airConAccessory.handleExternalIRCode('TEMPERATURE_23');
+
+      expect(airConAccessory.state.targetTemperature).to.equal(23);
+      expect(airConAccessory.state.targetHeatingCoolingState).to.equal(Characteristic.TargetHeatingCoolingState.HEAT);
+      expect(airConAccessory.state.currentHeatingCoolingState).to.equal(Characteristic.TargetHeatingCoolingState.HEAT);
+      expect(airConAccessory.serviceManager.getCharacteristic(Characteristic.TargetTemperature).value).to.equal(23);
+      expect(device.getSentHexCodeCount()).to.equal(0);
+    });
+
+    it('turns the accessory off when the "off" hex code is detected', async () => {
+      const { device } = testSetup();
+      defaultConfig.host = device.host.address
+
+      const config = { ...defaultConfig };
+      const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
+      airConAccessory.hexReverseMap = airConAccessory.buildHexReverseMap();
+
+      device.resetSentHexCodes();
+
+      airConAccessory.handleExternalIRCode('OFF');
+
+      expect(airConAccessory.state.targetHeatingCoolingState).to.equal(Characteristic.TargetHeatingCoolingState.OFF);
+      expect(airConAccessory.state.currentHeatingCoolingState).to.equal(Characteristic.CurrentHeatingCoolingState.OFF);
+      expect(device.getSentHexCodeCount()).to.equal(0);
+    });
+
+    it('ignores an unrecognised hex code', async () => {
+      const { device } = testSetup();
+      defaultConfig.host = device.host.address
+
+      const config = { ...defaultConfig };
+      const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
+      airConAccessory.hexReverseMap = airConAccessory.buildHexReverseMap();
+
+      const previousTargetTemperature = airConAccessory.state.targetTemperature;
+      const previousTargetHeatingCoolingState = airConAccessory.state.targetHeatingCoolingState;
+      device.resetSentHexCodes();
+
+      airConAccessory.handleExternalIRCode('SOME_UNKNOWN_HEX');
+
+      expect(airConAccessory.state.targetTemperature).to.equal(previousTargetTemperature);
+      expect(airConAccessory.state.targetHeatingCoolingState).to.equal(previousTargetHeatingCoolingState);
+      expect(device.getSentHexCodeCount()).to.equal(0);
+    });
+  });
+
+  describe('resuming the last used temperature per mode after being turned off', () => {
+    it('resumes the last cool temperature instead of resetting to defaultCoolTemperature', async () => {
+      const { device } = testSetup();
+      defaultConfig.host = device.host.address
+
+      const config = { ...defaultConfig };
+      const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
+
+      // Turn on to cool (defaults to 16), then change to a non-default temperature (18)
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetHeatingCoolingState, Characteristic.TargetHeatingCoolingState.COOL);
+      await delayForDuration(0.6);
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetTemperature, 18);
+      await delayForDuration(0.6);
+
+      // Turn off
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetHeatingCoolingState, Characteristic.TargetHeatingCoolingState.OFF);
+      await delayForDuration(0.6);
+
+      device.resetSentHexCodes();
+
+      // Turn cool back on - should resume 18, not reset to the configured default (16)
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetHeatingCoolingState, Characteristic.TargetHeatingCoolingState.COOL);
+      await delayForDuration(0.6);
+
+      expect(airConAccessory.state.targetTemperature).to.equal(18);
+      hexCheck({ device, codes: [ 'TEMPERATURE_18' ], count: 1 });
+    }).timeout(4000);
+
+    it('resumes the last heat temperature instead of resetting to defaultHeatTemperature', async () => {
+      const { device } = testSetup();
+      defaultConfig.host = device.host.address
+
+      const config = { ...defaultConfig };
+      const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
+
+      // Turn on to heat (defaults to 30), then change to a non-default temperature (26)
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetHeatingCoolingState, Characteristic.TargetHeatingCoolingState.HEAT);
+      await delayForDuration(0.6);
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetTemperature, 26);
+      await delayForDuration(0.6);
+
+      // Turn off
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetHeatingCoolingState, Characteristic.TargetHeatingCoolingState.OFF);
+      await delayForDuration(0.6);
+
+      device.resetSentHexCodes();
+
+      // Turn heat back on - should resume 26, not reset to the configured default (30)
+      airConAccessory.serviceManager.setCharacteristic(Characteristic.TargetHeatingCoolingState, Characteristic.TargetHeatingCoolingState.HEAT);
+      await delayForDuration(0.6);
+
+      expect(airConAccessory.state.targetTemperature).to.equal(26);
+      hexCheck({ device, codes: [ 'TEMPERATURE_26' ], count: 1 });
+    }).timeout(4000);
   });
 })

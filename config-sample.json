@@ -167,6 +167,7 @@
 				"autoCoolTemperature": 23,
 				"autoHeatTemperature": 14,
 				"autoSwitch": "A/C Auto Switch",
+				"listenForRemoteUpdates": true,
 				"data": {
 					"off": "2600500000012...",
 					"heat30": {
@@ -349,6 +350,7 @@
         "maxTemperature": 84,
         "temperatureUnits": "F",
         "fanStepSize": 50,
+        "listenForRemoteUpdates": true,
         "data": {
           "cool": {
             "on": "Hex code to set device to cool mode or turn or device",
