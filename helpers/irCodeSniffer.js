@@ -8,6 +8,7 @@ const { getDevice } = require('./getDevice');
 
 const POLL_INTERVAL = 1500;
 const RETRY_INTERVAL = 5000;
+const REARM_AFTER_SEND_DELAY = 500;
 
 // Accessories aren't required to set a per-accessory "host" - like sendData()/getDevice(),
 // an accessory with no host configured falls back to "the single discovered device". All such
@@ -100,11 +101,10 @@ const poll = (key) => {
 
     try {
       await current.device.mutex.use(async () => {
-        // Re-arm learning mode on every tick, not just after a capture - actually transmitting
-        // an IR/RF command (e.g. turning the AC on/off from HomeKit or MQTT) can silently knock
-        // some Broadlink firmwares out of learning mode with no error of any kind, so this keeps
-        // the listener self-healing instead of going silently dead until Homebridge restarts.
-        current.device.enterLearning();
+        // Only poll here - never re-arm on a timer. enterLearning() clears the device's capture
+        // buffer, so calling it before each checkData() would wipe a code received from the
+        // remote moments earlier and nothing would ever be captured. Learning mode is armed once
+        // in startLoop() and re-armed in onRawData() after each successful capture.
         current.device.checkData();
       });
     } catch (err) {
@@ -114,6 +114,35 @@ const poll = (key) => {
 
     poll(key);
   }, POLL_INTERVAL);
+}
+
+// Called by helpers/sendData.js once a transmission has completed. Actually transmitting an
+// IR/RF code takes the Broadlink device out of learning mode silently - with no error and no
+// event - so any accessory listening on that same device would go permanently deaf after the
+// first code the plugin sends. Re-arming here (rather than on the poll timer) is deliberate:
+// enterLearning() clears the capture buffer, so it must only happen when no captured code
+// could be waiting to be read.
+const rearmAfterSend = (device, log, logLevel) => {
+  if (!device) {return;}
+
+  Object.keys(registry).forEach((key) => {
+    const entry = registry[key];
+    if (!entry || entry.device !== device) {return;}
+
+    // Give the transmission a moment to finish before re-arming
+    setTimeout(() => {
+      const current = registry[key];
+      if (!current || current.device !== device) {return;}
+
+      try {
+        device.enterLearning();
+
+        if (logLevel <= 1) {log(`\x1b[34m[DEBUG]\x1b[0m IR Code Sniffer (${labelFor(current.host)}) re-armed learning mode after sending a code.`);}
+      } catch (err) {
+        if (logLevel <= 4) {log(`\x1b[31m[ERROR]\x1b[0m IR Code Sniffer (${labelFor(current.host)}) failed to re-arm learning mode after sending: ${err.message}`);}
+      }
+    }, REARM_AFTER_SEND_DELAY);
+  });
 }
 
 const stopLoop = (key) => {
@@ -131,4 +160,4 @@ const stopLoop = (key) => {
   delete registry[key];
 }
 
-module.exports = { subscribe, unsubscribe };
+module.exports = { subscribe, unsubscribe, rearmAfterSend };

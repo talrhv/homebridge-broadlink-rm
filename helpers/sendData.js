@@ -2,6 +2,7 @@ const assert = require('assert')
 
 const { getDevice } = require('./getDevice');
 const convertProntoCode = require('./convertProntoCode')
+const irCodeSniffer = require('./irCodeSniffer')
 
 module.exports = async ({ host, hexData, log, name, logLevel }) => {
   assert(hexData && typeof hexData === 'string', `\x1b[31m[ERROR]: \x1b[0m${name} sendData (HEX value is missing)`);
@@ -31,7 +32,12 @@ module.exports = async ({ host, hexData, log, name, logLevel }) => {
   await device.mutex.use(async () => {
     const hexDataBuffer = new Buffer(hexData, 'hex');
     device.sendData(hexDataBuffer, logLevel, hexData);
-    
+
     if (logLevel <=2) {log(`${name} sendHex (${device.host.address}; ${device.host.macAddress}) ${hexData}`);}
   });
+
+  // Sending takes the device out of learning mode, which would silently deafen any accessory
+  // passively listening for physical remote-control codes ( "listenForRemoteUpdates" ). Called
+  // outside the mutex above - the Mutex isn't reentrant, so re-arming within it would deadlock.
+  irCodeSniffer.rearmAfterSend(device, log, logLevel);
 }
