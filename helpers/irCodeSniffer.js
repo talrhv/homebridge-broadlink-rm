@@ -12,11 +12,15 @@ const RETRY_INTERVAL = 5000;
 const registry = {};
 
 const subscribe = (host, log, logLevel, onCode) => {
-  if (!host) {return;}
+  if (!host) {
+    if (logLevel <= 4) {log(`\x1b[31m[ERROR]\x1b[0m IR Code Sniffer requires a "host" to be configured on this accessory - passive remote-control detection will not run.`);}
+
+    return;
+  }
 
   let entry = registry[host];
   if (!entry) {
-    entry = { subscribers: new Set(), device: null, onRawData: null, pollTimeout: null, retryTimeout: null };
+    entry = { subscribers: new Set(), device: null, onRawData: null, pollTimeout: null, retryTimeout: null, hasLoggedWaiting: false };
     registry[host] = entry;
   }
 
@@ -41,16 +45,23 @@ const startLoop = (host, log, logLevel) => {
   const device = getDevice({ host, log, learnOnly: true });
 
   if (!device || !device.enterLearning) {
+    if (!entry.hasLoggedWaiting) {
+      entry.hasLoggedWaiting = true;
+      if (logLevel <= 3) {log(`\x1b[33m[WARNING]\x1b[0m IR Code Sniffer (${host}) device not yet discovered or doesn't support IR learning - will keep retrying every ${RETRY_INTERVAL / 1000}s.`);}
+    }
+
     entry.retryTimeout = setTimeout(() => startLoop(host, log, logLevel), RETRY_INTERVAL);
     return;
   }
 
   entry.device = device;
 
+  if (logLevel <= 2) {log(`\x1b[35m[INFO]\x1b[0m IR Code Sniffer (${host}) now listening for physical remote-control codes.`);}
+
   entry.onRawData = (message) => {
     const hex = message.toString('hex');
 
-    if (logLevel <= 1) {log(`\x1b[35m[DEBUG]\x1b[0m IR Code Sniffer (${host}) captured hex: ${hex}`);}
+    if (logLevel <= 2) {log(`\x1b[35m[INFO]\x1b[0m IR Code Sniffer (${host}) captured hex: ${hex}`);}
 
     entry.subscribers.forEach((onCode) => {
       try {

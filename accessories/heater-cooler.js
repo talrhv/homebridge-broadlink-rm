@@ -183,7 +183,11 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     const { hexReverseMap, log, logLevel, name, serviceManager, state } = this;
 
     const match = hexReverseMap && hexReverseMap[hex];
-    if (!match) {return;}
+    if (!match) {
+      if (logLevel <=1) {log(`\x1b[34m[DEBUG]\x1b[0m ${name} handleExternalIRCode (captured hex did not match any known code for this accessory: ${hex})`);}
+
+      return;
+    }
 
     if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify(match)})`);}
 
