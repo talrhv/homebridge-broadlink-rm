@@ -7,6 +7,7 @@ const FakeServiceManager = require('./helpers/fakeServiceManager')
 const hexCheck = require('./helpers/hexCheck')
 const delayForDuration = require('../helpers/delayForDuration')
 const { getDevice } = require('../helpers/getDevice')
+const { buildIRHex, jitter } = require('./helpers/irHex')
 
 const { AirCon, Switch } = require('../accessories')
 
@@ -562,17 +563,31 @@ describe('airConAccessory', async () => {
   });
 
   describe('handleExternalIRCode (passive remote-control detection)', () => {
+    // Distinct, well-separated (pairwise average pulse difference >= 12) synthetic pulse
+    // patterns - real IR captures of different remote buttons look like this: same overall
+    // structure, very different bit content. jitter() simulates the receiver's natural timing
+    // noise on a live capture of the same button.
+    const OFF_PULSES = [54,54,54,20,20,54,54,54,54,54,20,54,20,54,54,54,54,54,20,54,54,20,20,20,20,20,20,54,54,20,54,20];
+    const TEMPERATURE_23_PULSES = [54,20,20,54,20,20,20,54,54,54,54,20,20,20,54,54,54,20,20,54,54,54,20,20,54,20,20,54,20,20,20,20];
+
+    const irData = {
+      off: buildIRHex(OFF_PULSES),
+      temperature23: {
+        'pseudo-mode': 'heat',
+        'data': buildIRHex(TEMPERATURE_23_PULSES)
+      }
+    };
+
     it('updates target temperature and mode from a known remote-control hex code, without sending anything', async () => {
       const { device } = testSetup();
-      defaultConfig.host = device.host.address
 
-      const config = { ...defaultConfig };
+      const config = { ...defaultConfig, data: irData, host: device.host.address };
       const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
-      airConAccessory.hexReverseMap = airConAccessory.buildHexReverseMap();
+      airConAccessory.irCodeCandidates = airConAccessory.buildIRCodeCandidates();
 
       device.resetSentHexCodes();
 
-      airConAccessory.handleExternalIRCode('TEMPERATURE_23');
+      airConAccessory.handleExternalIRCode(buildIRHex(jitter(TEMPERATURE_23_PULSES)));
 
       expect(airConAccessory.state.targetTemperature).to.equal(23);
       expect(airConAccessory.state.targetHeatingCoolingState).to.equal(Characteristic.TargetHeatingCoolingState.HEAT);
@@ -583,15 +598,14 @@ describe('airConAccessory', async () => {
 
     it('turns the accessory off when the "off" hex code is detected', async () => {
       const { device } = testSetup();
-      defaultConfig.host = device.host.address
 
-      const config = { ...defaultConfig };
+      const config = { ...defaultConfig, data: irData, host: device.host.address };
       const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
-      airConAccessory.hexReverseMap = airConAccessory.buildHexReverseMap();
+      airConAccessory.irCodeCandidates = airConAccessory.buildIRCodeCandidates();
 
       device.resetSentHexCodes();
 
-      airConAccessory.handleExternalIRCode('OFF');
+      airConAccessory.handleExternalIRCode(buildIRHex(jitter(OFF_PULSES)));
 
       expect(airConAccessory.state.targetHeatingCoolingState).to.equal(Characteristic.TargetHeatingCoolingState.OFF);
       expect(airConAccessory.state.currentHeatingCoolingState).to.equal(Characteristic.CurrentHeatingCoolingState.OFF);
@@ -600,17 +614,17 @@ describe('airConAccessory', async () => {
 
     it('ignores an unrecognised hex code', async () => {
       const { device } = testSetup();
-      defaultConfig.host = device.host.address
 
-      const config = { ...defaultConfig };
+      const config = { ...defaultConfig, data: irData, host: device.host.address };
       const airConAccessory = new AirCon(null, config, 'FakeServiceManager');
-      airConAccessory.hexReverseMap = airConAccessory.buildHexReverseMap();
+      airConAccessory.irCodeCandidates = airConAccessory.buildIRCodeCandidates();
 
       const previousTargetTemperature = airConAccessory.state.targetTemperature;
       const previousTargetHeatingCoolingState = airConAccessory.state.targetHeatingCoolingState;
       device.resetSentHexCodes();
 
-      airConAccessory.handleExternalIRCode('SOME_UNKNOWN_HEX');
+      // Different length entirely - guaranteed to fall outside the pulse-count tolerance
+      airConAccessory.handleExternalIRCode(buildIRHex([20, 54, 20, 54, 20, 54, 20, 54]));
 
       expect(airConAccessory.state.targetTemperature).to.equal(previousTargetTemperature);
       expect(airConAccessory.state.targetHeatingCoolingState).to.equal(previousTargetHeatingCoolingState);

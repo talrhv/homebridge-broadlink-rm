@@ -8,6 +8,7 @@ const ServiceManagerTypes = require('../helpers/serviceManagerTypes');
 const catchDelayCancelError = require('../helpers/catchDelayCancelError');
 const { getDevice } = require('../helpers/getDevice');
 const irCodeSniffer = require('../helpers/irCodeSniffer');
+const { decodePulses, findClosestMatch } = require('../helpers/irPulseMatcher');
 const BroadlinkRMAccessory = require('./accessory');
 
 class AirConAccessory extends BroadlinkRMAccessory {
@@ -45,20 +46,22 @@ class AirConAccessory extends BroadlinkRMAccessory {
     this.monitorTemperature();
 
     if (config.listenForRemoteUpdates) {
-      this.hexReverseMap = this.buildHexReverseMap();
+      this.irCodeCandidates = this.buildIRCodeCandidates();
       irCodeSniffer.subscribe(this.host, this.log, this.logLevel, this.handleExternalIRCode.bind(this));
     }
   }
 
-  // Builds a { hexString: { mode, temperature } } lookup from this accessory's own `data`
+  // Builds a list of { pulses, mode, temperature } candidates from this accessory's own `data`
   // config so that a hex code captured from the physical remote (via irCodeSniffer) can be
-  // matched back to the mode/temperature it represents. Hex codes are opaque IR waveforms -
-  // this only recognises codes that are already present in this accessory's own config.
-  buildHexReverseMap () {
+  // matched back to the mode/temperature it represents. Each candidate's pulse-duration sequence
+  // is decoded once up front - matching against a live capture is then a pulse comparison
+  // (see helpers/irPulseMatcher.js), not an exact hex match, since a fresh IR capture is never
+  // byte-identical to a previously learned code.
+  buildIRCodeCandidates () {
     const { data } = this;
-    const reverseMap = {};
+    const candidates = [];
 
-    if (!data) {return reverseMap;}
+    if (!data) {return candidates;}
 
     Object.keys(data).forEach((key) => {
       const entry = data[key];
@@ -66,29 +69,32 @@ class AirConAccessory extends BroadlinkRMAccessory {
 
       if (!hex) {return;}
 
+      const pulses = decodePulses(hex);
+      if (!pulses) {return;}
+
       if (key === 'off' || key === 'offDryMode') {
-        reverseMap[hex] = { mode: 'off' };
+        candidates.push({ pulses, mode: 'off' });
         return;
       }
 
       if (key === 'heat' || key === 'cool' || key === 'auto') {
-        reverseMap[hex] = { mode: key };
+        candidates.push({ pulses, mode: key });
         return;
       }
 
       const modeTemperatureMatch = key.match(/^(heat|cool|auto)(\d+)$/);
       if (modeTemperatureMatch) {
-        reverseMap[hex] = { mode: modeTemperatureMatch[1], temperature: parseInt(modeTemperatureMatch[2], 10) };
+        candidates.push({ pulses, mode: modeTemperatureMatch[1], temperature: parseInt(modeTemperatureMatch[2], 10) });
         return;
       }
 
       const temperatureMatch = key.match(/^temperature(\d+)$/);
       if (temperatureMatch) {
-        reverseMap[hex] = { mode: entry && entry['pseudo-mode'], temperature: parseInt(temperatureMatch[1], 10) };
+        candidates.push({ pulses, mode: entry && entry['pseudo-mode'], temperature: parseInt(temperatureMatch[1], 10) });
       }
     });
 
-    return reverseMap;
+    return candidates;
   }
 
   // Called by irCodeSniffer whenever the Broadlink device captures any IR code. Reflects a
@@ -97,16 +103,16 @@ class AirConAccessory extends BroadlinkRMAccessory {
   // (see onMQTTMessage / updateTemperatureUI) which use updateCharacteristic() rather than
   // setCharacteristic() to avoid re-triggering an outbound send.
   handleExternalIRCode (hex) {
-    const { HeatingCoolingStates, hexReverseMap, log, logLevel, name, serviceManager, state } = this;
+    const { HeatingCoolingStates, irCodeCandidates, log, logLevel, name, serviceManager, state } = this;
 
-    const match = hexReverseMap && hexReverseMap[hex];
+    const match = findClosestMatch(hex, irCodeCandidates || []);
     if (!match) {
       if (logLevel <=1) {log(`\x1b[34m[DEBUG]\x1b[0m ${name} handleExternalIRCode (captured hex did not match any known code for this accessory: ${hex})`);}
 
       return;
     }
 
-    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify(match)})`);}
+    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify({ mode: match.mode, temperature: match.temperature })})`);}
 
     if (match.mode) {
       const heatingCoolingState = HeatingCoolingStates[match.mode];

@@ -8,6 +8,7 @@ const ServiceManagerTypes = require('../helpers/serviceManagerTypes');
 const catchDelayCancelError = require('../helpers/catchDelayCancelError');
 const { getDevice, discoverDevices } = require('../helpers/getDevice');
 const irCodeSniffer = require('../helpers/irCodeSniffer');
+const { decodePulses, findClosestMatch } = require('../helpers/irPulseMatcher');
 const BroadlinkRMAccessory = require('./accessory');
 
 // Initializing predefined constants based on homekit API
@@ -75,33 +76,36 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     if (config.mqttPowerSensor) {this.setupPowerSensor();}
 
     if (config.listenForRemoteUpdates) {
-      this.hexReverseMap = this.buildHexReverseMap();
+      this.irCodeCandidates = this.buildIRCodeCandidates();
       irCodeSniffer.subscribe(this.host, this.log, this.logLevel, this.handleExternalIRCode.bind(this));
     }
   }
 
   /**
-   * Builds a { hexString: matchInfo } lookup by walking this accessory's own data.cool/data.heat
-   * hex trees, so that a hex code captured from the physical remote (via irCodeSniffer) can be
-   * matched back to the mode/temperature/rotationSpeed/swingMode it represents. Hex codes are
-   * opaque IR waveforms - this only recognises codes that are already present in this
-   * accessory's own config.
+   * Builds a list of { pulses, mode, active, temperature, rotationSpeed, swingMode } candidates
+   * by walking this accessory's own data.cool/data.heat hex trees, so that a hex code captured
+   * from the physical remote (via irCodeSniffer) can be matched back to the state it represents.
+   * Each candidate's pulse-duration sequence is decoded once up front - matching against a live
+   * capture is then a pulse comparison (see helpers/irPulseMatcher.js), not an exact hex match,
+   * since a fresh IR capture is never byte-identical to a previously learned code.
    */
-  buildHexReverseMap() {
+  buildIRCodeCandidates() {
     const { data } = this;
-    const reverseMap = {};
+    const candidates = [];
 
-    if (!data) {return reverseMap;}
+    if (!data) {return candidates;}
 
     ['cool', 'heat'].forEach((mode) => {
       const modeData = data[mode];
       if (!modeData || typeof modeData !== 'object') {return;}
 
       this.collectHexValues(modeData.on).forEach((hex) => {
-        reverseMap[hex] = { mode, active: true };
+        const pulses = decodePulses(hex);
+        if (pulses) {candidates.push({ pulses, mode, active: true });}
       });
       this.collectHexValues(modeData.off).forEach((hex) => {
-        reverseMap[hex] = { mode, active: false };
+        const pulses = decodePulses(hex);
+        if (pulses) {candidates.push({ pulses, mode, active: false });}
       });
 
       const { temperatureCodes } = modeData;
@@ -112,21 +116,24 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
         if (isNaN(temperature)) {return;}
 
         this.collectLeafHexPaths(temperatureCodes[temperatureKey]).forEach(({ hex, path }) => {
-          const match = { mode, active: true, temperature };
+          const pulses = decodePulses(hex);
+          if (!pulses) {return;}
+
+          const candidate = { pulses, mode, active: true, temperature };
 
           path.forEach((key) => {
             const rotationSpeedMatch = key.match(/^rotationSpeed(\d+)$/);
-            if (rotationSpeedMatch) {match.rotationSpeed = parseInt(rotationSpeedMatch[1], 10);}
-            if (key === 'swingOn') {match.swingMode = Characteristic.SwingMode.SWING_ENABLED;}
-            if (key === 'swingOff') {match.swingMode = Characteristic.SwingMode.SWING_DISABLED;}
+            if (rotationSpeedMatch) {candidate.rotationSpeed = parseInt(rotationSpeedMatch[1], 10);}
+            if (key === 'swingOn') {candidate.swingMode = Characteristic.SwingMode.SWING_ENABLED;}
+            if (key === 'swingOff') {candidate.swingMode = Characteristic.SwingMode.SWING_DISABLED;}
           });
 
-          reverseMap[hex] = match;
+          candidates.push(candidate);
         });
       });
     });
 
-    return reverseMap;
+    return candidates;
   }
 
   // Extracts hex strings from a simple (non-tree) hex value - either a bare hex string or an
@@ -180,16 +187,16 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
   // mirrors the updateCharacteristic() (not setCharacteristic()) convention already used for
   // MQTT-sourced state in onMQTTPower above.
   handleExternalIRCode(hex) {
-    const { hexReverseMap, log, logLevel, name, serviceManager, state } = this;
+    const { irCodeCandidates, log, logLevel, name, serviceManager, state } = this;
 
-    const match = hexReverseMap && hexReverseMap[hex];
+    const match = findClosestMatch(hex, irCodeCandidates || []);
     if (!match) {
       if (logLevel <=1) {log(`\x1b[34m[DEBUG]\x1b[0m ${name} handleExternalIRCode (captured hex did not match any known code for this accessory: ${hex})`);}
 
       return;
     }
 
-    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify(match)})`);}
+    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify({ mode: match.mode, active: match.active, temperature: match.temperature, rotationSpeed: match.rotationSpeed, swingMode: match.swingMode })})`);}
 
     if (match.active === false) {
       state.active = Characteristic.Active.INACTIVE;

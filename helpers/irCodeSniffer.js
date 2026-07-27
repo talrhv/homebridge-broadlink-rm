@@ -9,65 +9,70 @@ const { getDevice } = require('./getDevice');
 const POLL_INTERVAL = 1500;
 const RETRY_INTERVAL = 5000;
 
+// Accessories aren't required to set a per-accessory "host" - like sendData()/getDevice(),
+// an accessory with no host configured falls back to "the single discovered device". All such
+// accessories share one registry entry, keyed by this sentinel (getDevice() itself still
+// receives the real, possibly-undefined host so its own fallback logic applies).
+const DEFAULT_KEY = '__default__';
+const registryKeyFor = (host) => host || DEFAULT_KEY;
+const labelFor = (host) => host || 'the default Broadlink device';
+
 const registry = {};
 
 const subscribe = (host, log, logLevel, onCode) => {
-  if (!host) {
-    if (logLevel <= 4) {log(`\x1b[31m[ERROR]\x1b[0m IR Code Sniffer requires a "host" to be configured on this accessory - passive remote-control detection will not run.`);}
+  const key = registryKeyFor(host);
 
-    return;
-  }
-
-  let entry = registry[host];
+  let entry = registry[key];
   if (!entry) {
-    entry = { subscribers: new Set(), device: null, onRawData: null, pollTimeout: null, retryTimeout: null, hasLoggedWaiting: false };
-    registry[host] = entry;
+    entry = { host, subscribers: new Set(), device: null, onRawData: null, pollTimeout: null, retryTimeout: null, hasLoggedWaiting: false };
+    registry[key] = entry;
   }
 
   entry.subscribers.add(onCode);
 
-  if (!entry.device) {startLoop(host, log, logLevel);}
+  if (!entry.device) {startLoop(key, log, logLevel);}
 }
 
 const unsubscribe = (host, onCode) => {
-  const entry = registry[host];
+  const key = registryKeyFor(host);
+  const entry = registry[key];
   if (!entry) {return;}
 
   entry.subscribers.delete(onCode);
 
-  if (entry.subscribers.size === 0) {stopLoop(host);}
+  if (entry.subscribers.size === 0) {stopLoop(key);}
 }
 
-const startLoop = (host, log, logLevel) => {
-  const entry = registry[host];
+const startLoop = (key, log, logLevel) => {
+  const entry = registry[key];
   if (!entry || entry.device) {return;}
 
-  const device = getDevice({ host, log, learnOnly: true });
+  const device = getDevice({ host: entry.host, log, learnOnly: true });
 
   if (!device || !device.enterLearning) {
     if (!entry.hasLoggedWaiting) {
       entry.hasLoggedWaiting = true;
-      if (logLevel <= 3) {log(`\x1b[33m[WARNING]\x1b[0m IR Code Sniffer (${host}) device not yet discovered or doesn't support IR learning - will keep retrying every ${RETRY_INTERVAL / 1000}s.`);}
+      if (logLevel <= 3) {log(`\x1b[33m[WARNING]\x1b[0m IR Code Sniffer (${labelFor(entry.host)}) device not yet discovered or doesn't support IR learning - will keep retrying every ${RETRY_INTERVAL / 1000}s.`);}
     }
 
-    entry.retryTimeout = setTimeout(() => startLoop(host, log, logLevel), RETRY_INTERVAL);
+    entry.retryTimeout = setTimeout(() => startLoop(key, log, logLevel), RETRY_INTERVAL);
     return;
   }
 
   entry.device = device;
 
-  if (logLevel <= 2) {log(`\x1b[35m[INFO]\x1b[0m IR Code Sniffer (${host}) now listening for physical remote-control codes.`);}
+  if (logLevel <= 2) {log(`\x1b[35m[INFO]\x1b[0m IR Code Sniffer (${labelFor(entry.host)}) now listening for physical remote-control codes.`);}
 
   entry.onRawData = (message) => {
     const hex = message.toString('hex');
 
-    if (logLevel <= 2) {log(`\x1b[35m[INFO]\x1b[0m IR Code Sniffer (${host}) captured hex: ${hex}`);}
+    if (logLevel <= 2) {log(`\x1b[35m[INFO]\x1b[0m IR Code Sniffer (${labelFor(entry.host)}) captured hex: ${hex}`);}
 
     entry.subscribers.forEach((onCode) => {
       try {
         onCode(hex);
       } catch (err) {
-        if (logLevel <= 4) {log(`\x1b[31m[ERROR]\x1b[0m IR Code Sniffer (${host}) subscriber error: ${err.message}`);}
+        if (logLevel <= 4) {log(`\x1b[31m[ERROR]\x1b[0m IR Code Sniffer (${labelFor(entry.host)}) subscriber error: ${err.message}`);}
       }
     });
 
@@ -78,27 +83,27 @@ const startLoop = (host, log, logLevel) => {
   device.on('rawData', entry.onRawData);
   device.enterLearning();
 
-  poll(host);
+  poll(key);
 }
 
-const poll = (host) => {
-  const entry = registry[host];
+const poll = (key) => {
+  const entry = registry[key];
   if (!entry || !entry.device) {return;}
 
   entry.pollTimeout = setTimeout(async () => {
-    const current = registry[host];
+    const current = registry[key];
     if (!current || !current.device) {return;}
 
     await current.device.mutex.use(async () => {
       current.device.checkData();
     });
 
-    poll(host);
+    poll(key);
   }, POLL_INTERVAL);
 }
 
-const stopLoop = (host) => {
-  const entry = registry[host];
+const stopLoop = (key) => {
+  const entry = registry[key];
   if (!entry) {return;}
 
   if (entry.pollTimeout) {clearTimeout(entry.pollTimeout);}
@@ -109,7 +114,7 @@ const stopLoop = (host) => {
     entry.device.cancelLearn();
   }
 
-  delete registry[host];
+  delete registry[key];
 }
 
 module.exports = { subscribe, unsubscribe };
