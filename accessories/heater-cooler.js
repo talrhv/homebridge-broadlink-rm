@@ -8,7 +8,7 @@ const ServiceManagerTypes = require('../helpers/serviceManagerTypes');
 const catchDelayCancelError = require('../helpers/catchDelayCancelError');
 const { getDevice, discoverDevices } = require('../helpers/getDevice');
 const irCodeSniffer = require('../helpers/irCodeSniffer');
-const { decodePulses, findClosestMatch } = require('../helpers/irPulseMatcher');
+const { decodePulses, toSymbols, findExactMatches, consensusState } = require('../helpers/irPulseMatcher');
 const BroadlinkRMAccessory = require('./accessory');
 
 // Initializing predefined constants based on homekit API
@@ -82,12 +82,11 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
   }
 
   /**
-   * Builds a list of { pulses, mode, active, temperature, rotationSpeed, swingMode } candidates
-   * by walking this accessory's own data.cool/data.heat hex trees, so that a hex code captured
-   * from the physical remote (via irCodeSniffer) can be matched back to the state it represents.
-   * Each candidate's pulse-duration sequence is decoded once up front - matching against a live
-   * capture is then a pulse comparison (see helpers/irPulseMatcher.js), not an exact hex match,
-   * since a fresh IR capture is never byte-identical to a previously learned code.
+   * Builds the { symbols, state } candidate list used to recognise a hex code captured from the
+   * physical remote (via irCodeSniffer), by walking this accessory's own data.cool/data.heat hex
+   * trees. Each learned code is reduced once up front to a jitter-tolerant symbol string; a live
+   * capture is then matched against those exactly - see helpers/irPulseMatcher.js for why
+   * approximate matching is unsafe here.
    */
   buildIRCodeCandidates() {
     const { data } = this;
@@ -95,18 +94,19 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     if (!data) {return candidates;}
 
+    const add = (hex, state) => {
+      const symbols = toSymbols(decodePulses(hex));
+      if (!symbols) {return;}
+
+      candidates.push({ symbols, state });
+    }
+
     ['cool', 'heat'].forEach((mode) => {
       const modeData = data[mode];
       if (!modeData || typeof modeData !== 'object') {return;}
 
-      this.collectHexValues(modeData.on).forEach((hex) => {
-        const pulses = decodePulses(hex);
-        if (pulses) {candidates.push({ pulses, mode, active: true });}
-      });
-      this.collectHexValues(modeData.off).forEach((hex) => {
-        const pulses = decodePulses(hex);
-        if (pulses) {candidates.push({ pulses, mode, active: false });}
-      });
+      this.collectHexValues(modeData.on).forEach((hex) => add(hex, { mode, active: true }));
+      this.collectHexValues(modeData.off).forEach((hex) => add(hex, { active: false }));
 
       const { temperatureCodes } = modeData;
       if (!temperatureCodes || typeof temperatureCodes !== 'object') {return;}
@@ -116,19 +116,16 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
         if (isNaN(temperature)) {return;}
 
         this.collectLeafHexPaths(temperatureCodes[temperatureKey]).forEach(({ hex, path }) => {
-          const pulses = decodePulses(hex);
-          if (!pulses) {return;}
-
-          const candidate = { pulses, mode, active: true, temperature };
+          const state = { mode, active: true, temperature };
 
           path.forEach((key) => {
             const rotationSpeedMatch = key.match(/^rotationSpeed(\d+)$/);
-            if (rotationSpeedMatch) {candidate.rotationSpeed = parseInt(rotationSpeedMatch[1], 10);}
-            if (key === 'swingOn') {candidate.swingMode = Characteristic.SwingMode.SWING_ENABLED;}
-            if (key === 'swingOff') {candidate.swingMode = Characteristic.SwingMode.SWING_DISABLED;}
+            if (rotationSpeedMatch) {state.rotationSpeed = parseInt(rotationSpeedMatch[1], 10);}
+            if (key === 'swingOn') {state.swingMode = Characteristic.SwingMode.SWING_ENABLED;}
+            if (key === 'swingOff') {state.swingMode = Characteristic.SwingMode.SWING_DISABLED;}
           });
 
-          candidates.push(candidate);
+          add(hex, state);
         });
       });
     });
@@ -189,17 +186,27 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
   handleExternalIRCode(hex) {
     const { irCodeCandidates, log, logLevel, name, serviceManager, state } = this;
 
-    const match = findClosestMatch(hex, irCodeCandidates || []);
-    if (!match) {
+    const matches = findExactMatches(hex, irCodeCandidates || []);
+    if (matches.length === 0) {
       if (logLevel <=1) {log(`\x1b[34m[DEBUG]\x1b[0m ${name} handleExternalIRCode (captured hex did not match any known code for this accessory: ${hex})`);}
 
       return;
     }
 
-    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify({ mode: match.mode, active: match.active, temperature: match.temperature, rotationSpeed: match.rotationSpeed, swingMode: match.swingMode })})`);}
+    const match = consensusState(matches);
+
+    if (Object.keys(match).length === 0) {
+      if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (captured code matches ${matches.length} conflicting entries - ignored)`);}
+
+      return;
+    }
+
+    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify(match)})`);}
 
     if (match.active === false) {
       state.active = Characteristic.Active.INACTIVE;
+      // Reporting "off" can't cause a transmission, so it needs no confirmation from HomeKit
+      this.hasUnconfirmedPassiveState = false;
       serviceManager.updateCharacteristic(Characteristic.Active, state.active);
       this.updateServiceCurrentHeaterCoolerState();
 
@@ -208,6 +215,10 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     if (match.active === true) {
       state.active = Characteristic.Active.ACTIVE;
+      // Believing the unit is on is what unlocks the transmitting mode-switch in setTemperature.
+      // Since a later "off" press may go uncaptured, treat this as unconfirmed until HomeKit
+      // itself sets Active or the mode.
+      this.hasUnconfirmedPassiveState = true;
       serviceManager.updateCharacteristic(Characteristic.Active, state.active);
     }
 
@@ -401,6 +412,9 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     const { available } = internalConfig
     const { targetHeaterCoolerState } = state
     let { heatingThresholdTemperature, coolingThresholdTemperature } = state
+
+    // HomeKit asked for this mode, so the on/off state is now known rather than merely observed
+    this.hasUnconfirmedPassiveState = false
 
     if (logLevel <= 2) {log(`Changing target state from ${previousValue} to ${targetHeaterCoolerState}`)}
     switch (targetHeaterCoolerState) {
@@ -618,7 +632,14 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     // AUTO is left to the existing (mode-based) path since both sliders are active there.
     if (targetHeaterCoolerState !== Characteristic.TargetHeaterCoolerState.AUTO
       && sliderMode !== targetHeaterCoolerState) {
-      if (state.active === Characteristic.Active.ACTIVE && newValue !== previousValue) {
+      // Switching mode here transmits, which turns the unit on. Never do that off the back of
+      // state that was only *observed* ( "listenForRemoteUpdates" ): a passively detected code can
+      // be missed - notably the "off" press - leaving this believing the unit is running when it
+      // is not, so an unattended threshold write from a HomeKit automation would silently start
+      // the air-conditioner. Requires a real HomeKit on/off or mode change to confirm state first.
+      if (this.hasUnconfirmedPassiveState) {
+        if (logLevel <= 2) {log(`\x1b[33m[WARNING]\x1b[0m ${name} setTemperature: not switching mode - on/off state was detected from the physical remote and hasn't been confirmed from HomeKit, so no data sent`)}
+      } else if (state.active === Characteristic.Active.ACTIVE && newValue !== previousValue) {
         if (logLevel <= 2) {log(`${name} setTemperature: ${isCoolSlider ? 'cooling' : 'heating'} slider changed to ${newValue} while in ${isCoolSlider ? 'heat' : 'cool'} mode - switching mode`)}
         this.serviceManager.setCharacteristic(Characteristic.TargetHeaterCoolerState, sliderMode)
       } else {
@@ -649,6 +670,9 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     const { available } = config.internalConfig
     const { targetHeaterCoolerState } = state
     const requestedValue = state.active // state is already set by main handler before this subhandler is called
+
+    // HomeKit set the on/off state itself, so it's no longer merely observed from the remote
+    this.hasUnconfirmedPassiveState = false
 
     hexData = this.decodeHexFromConfig(CharacteristicName.ACTIVE)
 
@@ -1175,6 +1199,11 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     // The sensor always reports the plug, even while the tile is held back below
     this.updatePowerSensor(active);
+
+    // A power reading is measured evidence of what the unit is actually doing, so unlike a
+    // passively detected IR code it can be trusted to confirm the on/off state - including when it
+    // simply agrees with what's already believed, which is confirmation just the same.
+    this.hasUnconfirmedPassiveState = false;
 
     if (active === state.active) {return;}
 

@@ -1,5 +1,7 @@
 # Homebridge Broadlink RM Pro
 
+Maintained by [@talrhv](https://github.com/talrhv) — [talrhv/homebridge-broadlink-rm](https://github.com/talrhv/homebridge-broadlink-rm)
+
 ## Introduction
 Welcome to the Broadlink RM Mini and Broadlink RM Pro plugin for [Homebridge](https://github.com/nfarina/homebridge).
 
@@ -35,4 +37,4 @@ This plugin should now be able to discover your device.
 ## Thanks
 Original: Thanks to @tattn (https://github.com/tattn/homebridge-rm-mini3), @PJCzx (https://github.com/PJCzx/homebridge-thermostat), @momodalo (https://github.com/momodalo/broadlinkjs), and @lprhodes (https://github.com/lprhodes/homebridge-broadlink-rm) whose time and effort got this started.
 
-In this fork: Thanks to @kiwi-cam (https://github.com/kiwi-cam), @Cloudore (https://github.com/Cloudore) and @Faisalthe01 (https://github.com/Faisalthe01) for your work!
+This fork builds on the work of @kiwi-cam (https://github.com/kiwi-cam), whose version this is based on, along with @Cloudore (https://github.com/Cloudore) and @Faisalthe01 (https://github.com/Faisalthe01) — thank you!

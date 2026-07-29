@@ -2,8 +2,8 @@ const versionCheck = require('github-version-checker');
 const pkg = require('../package.json'); 
 
 const options = {
-  repo: 'homebridge-broadlink-rm', 
-  owner: 'kiwi-cam',
+  repo: 'homebridge-broadlink-rm',
+  owner: 'talrhv',
   currentVersion: pkg.version,
   excludePrereleases: true
 };

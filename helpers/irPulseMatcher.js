@@ -33,43 +33,62 @@ const decodePulses = (hexString) => {
   return pulses;
 }
 
-const MAX_PULSE_COUNT_DIFFERENCE = 3;
-const MAX_AVERAGE_PULSE_DIFFERENCE = 6;
+// Marks longer than this (in raw Broadlink units) are the protocol's "1" bit, shorter ones its
+// "0" bit. Real captures of the same button jitter by a couple of units around roughly 20 and 55,
+// so this sits far from both clusters and classification stays stable.
+const LONG_MARK_THRESHOLD = 35;
+const GAP_THRESHOLD = 100;
+const GAP_QUANTISATION = 50;
 
-// A Broadlink device's raw IR capture is never byte-identical between two presses of the same
-// remote button - the receiver's timing has a few units of jitter each time - so an exact hex
-// match against a previously learned code essentially never succeeds. Instead, each candidate's
-// pre-decoded pulse-duration sequence is compared against the freshly captured one (same pulse
-// count, within a small average per-pulse tolerance) and the closest sufficiently-similar
-// candidate wins.
-//
-// candidates: array of objects each carrying a pre-decoded `pulses` array (see decodePulses).
-// Returns the closest matching candidate object, or null if none are close enough.
-const findClosestMatch = (hex, candidates) => {
-  const pulses = decodePulses(hex);
+// Reduces a pulse train to a jitter-tolerant symbol string. Comparing these is what makes
+// matching reliable: averaging raw pulse differences cannot distinguish two codes that differ in
+// only a handful of bits (e.g. "off" versus "heat 24"), because capture jitter is larger than the
+// difference between the codes themselves.
+const toSymbols = (pulses) => {
   if (!pulses || pulses.length === 0) {return null;}
 
-  let best = null;
-  let bestAverageDifference = Infinity;
+  return pulses.map((pulse) => {
+    // Headers and inter-frame gaps are hundreds of units long; quantise them coarsely so that
+    // jitter doesn't change the symbol, but a genuinely different structure still does.
+    if (pulse > GAP_THRESHOLD) {return `G${Math.round(pulse / GAP_QUANTISATION)}`;}
 
-  candidates.forEach((candidate) => {
-    const candidatePulses = candidate.pulses;
-    if (!candidatePulses || Math.abs(candidatePulses.length - pulses.length) > MAX_PULSE_COUNT_DIFFERENCE) {return;}
-
-    const length = Math.min(candidatePulses.length, pulses.length);
-    let totalDifference = 0;
-    for (let i = 0; i < length; i++) {
-      totalDifference += Math.abs(candidatePulses[i] - pulses[i]);
-    }
-
-    const averageDifference = totalDifference / length;
-    if (averageDifference < bestAverageDifference) {
-      bestAverageDifference = averageDifference;
-      best = candidate;
-    }
-  });
-
-  return (best && bestAverageDifference <= MAX_AVERAGE_PULSE_DIFFERENCE) ? best : null;
+    return pulse >= LONG_MARK_THRESHOLD ? '1' : '0';
+  }).join(',');
 }
 
-module.exports = { decodePulses, findClosestMatch };
+// Returns every candidate whose symbol string is exactly equal to the captured code's.
+//
+// Matching is deliberately exact rather than "closest": an approximate match on this kind of data
+// is a coin flip between codes that mean very different things, and acting on the wrong one leaves
+// HomeKit believing the unit is in a state it isn't (which later transmissions would then act on).
+// Missing a press is safe; inventing the wrong one is not.
+const findExactMatches = (hex, candidates) => {
+  const symbols = toSymbols(decodePulses(hex));
+  if (!symbols) {return [];}
+
+  return candidates.filter((candidate) => candidate.symbols === symbols);
+}
+
+// A single IR waveform can legitimately carry more than one meaning - most AC remotes encode the
+// whole unit state in every code, so e.g. the "on" code can be byte-identical to "cool 24 with
+// fan 100", and "off" is often shared between heating and cooling. Rather than guessing between
+// them, this keeps only the properties every match agrees on: identical "off" codes still switch
+// the accessory off, while the mode/temperature they disagree about is simply left alone.
+const consensusState = (matches) => {
+  if (!matches || matches.length === 0) {return null;}
+
+  const keys = new Set();
+  matches.forEach(({ state }) => Object.keys(state || {}).forEach((key) => keys.add(key)));
+
+  const consensus = {};
+  keys.forEach((key) => {
+    const value = (matches[0].state || {})[key];
+    const unanimous = matches.every((match) => (match.state || {})[key] === value);
+
+    if (unanimous && value !== undefined) {consensus[key] = value;}
+  });
+
+  return consensus;
+}
+
+module.exports = { decodePulses, toSymbols, findExactMatches, consensusState };

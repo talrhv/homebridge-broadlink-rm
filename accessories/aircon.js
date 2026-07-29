@@ -8,7 +8,7 @@ const ServiceManagerTypes = require('../helpers/serviceManagerTypes');
 const catchDelayCancelError = require('../helpers/catchDelayCancelError');
 const { getDevice } = require('../helpers/getDevice');
 const irCodeSniffer = require('../helpers/irCodeSniffer');
-const { decodePulses, findClosestMatch } = require('../helpers/irPulseMatcher');
+const { decodePulses, toSymbols, findExactMatches, consensusState } = require('../helpers/irPulseMatcher');
 const BroadlinkRMAccessory = require('./accessory');
 
 class AirConAccessory extends BroadlinkRMAccessory {
@@ -51,17 +51,22 @@ class AirConAccessory extends BroadlinkRMAccessory {
     }
   }
 
-  // Builds a list of { pulses, mode, temperature } candidates from this accessory's own `data`
-  // config so that a hex code captured from the physical remote (via irCodeSniffer) can be
-  // matched back to the mode/temperature it represents. Each candidate's pulse-duration sequence
-  // is decoded once up front - matching against a live capture is then a pulse comparison
-  // (see helpers/irPulseMatcher.js), not an exact hex match, since a fresh IR capture is never
-  // byte-identical to a previously learned code.
+  // Builds the { symbols, state } candidate list used to recognise a hex code captured from the
+  // physical remote (via irCodeSniffer). Each learned code is reduced once up front to a
+  // jitter-tolerant symbol string; a live capture is then matched against those exactly - see
+  // helpers/irPulseMatcher.js for why approximate matching is unsafe here.
   buildIRCodeCandidates () {
     const { data } = this;
     const candidates = [];
 
     if (!data) {return candidates;}
+
+    const add = (hex, state) => {
+      const symbols = toSymbols(decodePulses(hex));
+      if (!symbols) {return;}
+
+      candidates.push({ symbols, state });
+    }
 
     Object.keys(data).forEach((key) => {
       const entry = data[key];
@@ -69,28 +74,25 @@ class AirConAccessory extends BroadlinkRMAccessory {
 
       if (!hex) {return;}
 
-      const pulses = decodePulses(hex);
-      if (!pulses) {return;}
-
       if (key === 'off' || key === 'offDryMode') {
-        candidates.push({ pulses, mode: 'off' });
+        add(hex, { mode: 'off' });
         return;
       }
 
       if (key === 'heat' || key === 'cool' || key === 'auto') {
-        candidates.push({ pulses, mode: key });
+        add(hex, { mode: key });
         return;
       }
 
       const modeTemperatureMatch = key.match(/^(heat|cool|auto)(\d+)$/);
       if (modeTemperatureMatch) {
-        candidates.push({ pulses, mode: modeTemperatureMatch[1], temperature: parseInt(modeTemperatureMatch[2], 10) });
+        add(hex, { mode: modeTemperatureMatch[1], temperature: parseInt(modeTemperatureMatch[2], 10) });
         return;
       }
 
       const temperatureMatch = key.match(/^temperature(\d+)$/);
       if (temperatureMatch) {
-        candidates.push({ pulses, mode: entry && entry['pseudo-mode'], temperature: parseInt(temperatureMatch[1], 10) });
+        add(hex, { mode: entry && entry['pseudo-mode'], temperature: parseInt(temperatureMatch[1], 10) });
       }
     });
 
@@ -105,29 +107,37 @@ class AirConAccessory extends BroadlinkRMAccessory {
   handleExternalIRCode (hex) {
     const { HeatingCoolingStates, irCodeCandidates, log, logLevel, name, serviceManager, state } = this;
 
-    const match = findClosestMatch(hex, irCodeCandidates || []);
-    if (!match) {
+    const matches = findExactMatches(hex, irCodeCandidates || []);
+    if (matches.length === 0) {
       if (logLevel <=1) {log(`\x1b[34m[DEBUG]\x1b[0m ${name} handleExternalIRCode (captured hex did not match any known code for this accessory: ${hex})`);}
 
       return;
     }
 
-    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify({ mode: match.mode, temperature: match.temperature })})`);}
+    const detected = consensusState(matches);
 
-    if (match.mode) {
-      const heatingCoolingState = HeatingCoolingStates[match.mode];
+    if (Object.keys(detected).length === 0) {
+      if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (captured code matches ${matches.length} conflicting entries - ignored)`);}
+
+      return;
+    }
+
+    if (logLevel <=2) {log(`\x1b[35m[INFO]\x1b[0m ${name} handleExternalIRCode (detected remote control code: ${JSON.stringify(detected)})`);}
+
+    if (detected.mode) {
+      const heatingCoolingState = HeatingCoolingStates[detected.mode];
 
       if (heatingCoolingState !== undefined) {
         state.targetHeatingCoolingState = heatingCoolingState;
-        state.currentHeatingCoolingState = (match.mode === 'off') ? Characteristic.CurrentHeatingCoolingState.OFF : heatingCoolingState;
+        state.currentHeatingCoolingState = (detected.mode === 'off') ? Characteristic.CurrentHeatingCoolingState.OFF : heatingCoolingState;
 
         serviceManager.updateCharacteristic(Characteristic.TargetHeatingCoolingState, state.targetHeatingCoolingState);
         serviceManager.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, state.currentHeatingCoolingState);
       }
     }
 
-    if (match.temperature !== undefined) {
-      state.targetTemperature = match.temperature;
+    if (detected.temperature !== undefined) {
+      state.targetTemperature = detected.temperature;
       serviceManager.updateCharacteristic(Characteristic.TargetTemperature, state.targetTemperature);
     }
   }
