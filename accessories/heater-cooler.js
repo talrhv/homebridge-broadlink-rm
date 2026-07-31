@@ -369,6 +369,18 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     // HomeKit asked for this mode, so the on/off state is now known rather than merely observed
     this.hasUnconfirmedPassiveState = false
 
+    // A mode write while the unit is off must not transmit: AC codes always encode the whole unit
+    // state, so any mode code doubles as a power-on command. The comment above assumes HomeKit
+    // only writes the mode while (turning) on, but automations and scenes replay their captured
+    // snapshot - including the mode - even when the scene itself sets the unit to off, which used
+    // to switch the air-conditioner on unattended. The mode is kept so that turning on later
+    // (which is what actually transmits, via setActive) starts in the requested mode.
+    if (state.active !== Characteristic.Active.ACTIVE) {
+      if (logLevel <= 2) {log(`${this.name} setTargetHeaterCoolerState: unit is off - mode ${targetHeaterCoolerState} stored for next power-on, no data sent`)}
+
+      return;
+    }
+
     if (logLevel <= 2) {log(`Changing target state from ${previousValue} to ${targetHeaterCoolerState}`)}
     switch (targetHeaterCoolerState) {
       case Characteristic.TargetHeaterCoolerState.COOL:
@@ -604,6 +616,15 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
 
     const targetTemperature = targetHeaterCoolerState === Characteristic.TargetHeaterCoolerState.COOL ? coolingThresholdTemperature : heatingThresholdTemperature;
 
+    // Temperature codes encode the whole unit state, so transmitting one while the unit is off
+    // powers it on. Automations/scenes write their captured thresholds even when the scene sets
+    // the unit to off - store the value for the next power-on instead of sending it.
+    if (state.active !== Characteristic.Active.ACTIVE) {
+      if (logLevel <= 2) {log(`${name} setTemperature: unit is off - temperature ${targetTemperature} stored for next power-on, no data sent`)}
+
+      return
+    }
+
     if (logLevel <= 2) {log(`${name} setTemperature: Changing temperature from ${previousValue} to ${targetTemperature}`)}
     hexData = this.decodeHexFromConfig(targetHeaterCoolerState === Characteristic.TargetHeaterCoolerState.COOL ? CharacteristicName.CoolingThresholdTemperature : CharacteristicName.HeatingThresholdTemperature)
 
@@ -679,6 +700,14 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
     const { state, data, config, log, logLevel, name } = this
     const { swingMode } = state
 
+    // Swing codes encode the whole unit state, so transmitting one while the unit is off powers
+    // it on (scenes replay their captured swing setting even when the scene turns the unit off)
+    if (state.active !== Characteristic.Active.ACTIVE) {
+      if (logLevel <= 2) {log(`${name} setSwingMode: unit is off - swing setting stored for next power-on, no data sent`)}
+
+      return
+    }
+
     if (logLevel <= 2) {log(`${name} setSwingMode: Changing swing from ${previousValue} to ${Characteristic.SwingMode.SWING_ENABLED}`)}
     if (data.swingOn && data.swingOff) {
       hexData = swingMode === Characteristic.SwingMode.SWING_ENABLED ? data.swingOn : data.swingOff
@@ -717,6 +746,14 @@ class HeaterCoolerAccessory extends BroadlinkRMAccessory {
       state.rotationSpeed = previousValue
       // set active handler (called by homebridge/home app) will take
       // care of turning off the fan
+      return
+    }
+
+    // Fan speed codes encode the whole unit state, so transmitting one while the unit is off
+    // powers it on (scenes replay their captured fan speed even when the scene turns the unit off)
+    if (state.active !== Characteristic.Active.ACTIVE) {
+      if (logLevel <= 2) {log(`${name} setRotationSpeed: unit is off - fan speed stored for next power-on, no data sent`)}
+
       return
     }
 
